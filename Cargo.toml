@@ -1,0 +1,14 @@
+[package]
+edition = "2018"
+name = "cargo-scripts"
+version = "0.0.0"
+authors = ["Ryo Yamashita <qryxip@gmail.com>"]
+description = "Rust template for CLI tools."
+publish = false
+readme = "README.md"
+keywords = ["cargo", "cargo-subcommand"]
+categories = ["development-tools", "development-tools::cargo-plugins"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/qryxip/cargo-scripts"
+
+[dependencies]
