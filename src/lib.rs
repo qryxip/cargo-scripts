@@ -1,3 +1,5 @@
+#![warn(rust_2018_idioms)]
+
 use anyhow::{anyhow, bail, ensure, Context as _};
 use cargo_metadata::{Package, Resolve, Target};
 use if_chain::if_chain;
@@ -312,11 +314,11 @@ impl Context<Stdin, Stdout> {
             }
 
             impl<W: WriteColor + Sync + Send> Log for Logger<W> {
-                fn enabled(&self, metadata: &log::Metadata) -> bool {
+                fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
                     metadata.target().split("::").next() == Some(FILTER_MODULE)
                 }
 
-                fn log(&self, record: &Record) {
+                fn log(&self, record: &Record<'_>) {
                     if self.enabled(record.metadata()) {
                         let mut wtr = self.wtr.lock().unwrap();
                         let (header_fg, header) = match record.level() {
