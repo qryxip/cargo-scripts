@@ -3,7 +3,7 @@ edition = "2018"
 name = "cargo-scripts"
 version = "0.0.0"
 authors = ["Ryo Yamashita <qryxip@gmail.com>"]
-description = "Rust template for CLI tools."
+description = "A Cargo subcommand for managing Rust \"script\"s."
 publish = false
 readme = "README.md"
 keywords = ["cargo", "cargo-subcommand"]
@@ -12,3 +12,33 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/qryxip/cargo-scripts"
 
 [dependencies]
+_ = { package = "proc-macro2", version = "1.0.9", default-features = false, features = ["span-locations"] }
+anyhow = "1.0.26"
+atty = "0.2.14"
+cargo_metadata = "0.9.1"
+duct = "0.13.3"
+human-panic = "1.0.1"
+if_chain = "1.0.0"
+ignore = "0.4.11"
+indexmap = { version = "1.3.2", features = ["serde-1"] }
+itertools = "0.8.2"
+log = "0.4.8"
+once_cell = "1.3.1"
+pulldown-cmark = "0.7.0"
+regex = "1.3.4"
+remove_dir_all = "0.5.2"
+serde = { version = "1.0.104", features = ["derive"] }
+serde_json = "1.0.48"
+shell-escape = "0.1.4"
+structopt = "0.3.11"
+strum = { version = "0.18.0", features = ["derive"] }
+syn = "1.0.16"
+termcolor = "1.1.0"
+toml = "0.5.6"
+toml_edit = "0.1.5"
+ureq = "0.11.4"
+url = { version = "2.1.1", features = ["serde"] }
+
+[target.'cfg(windows)'.dependencies]
+winapi = "0.3.8"
+winapi-util = "0.1.3"
