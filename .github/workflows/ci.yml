@@ -71,31 +71,23 @@ jobs:
       fail-fast: false
       matrix:
         name:
-          - stable-x86_64-pc-windows-msvc (locked)
-          - stable-x86_64-apple-darwin (locked)
-          - stable-x86_64-unknown-linux-gnu (locked)
-          - stable-x86_64-unknown-linux-musl (locked)
-          - stable-x86_64-pc-windows-msvc (maximal)
-          - stable-x86_64-apple-darwin (maximal)
-          - stable-x86_64-unknown-linux-gnu (maximal)
-          - stable-x86_64-unknown-linux-musl (maximal)
-          - beta-x86_64-pc-windows-msvc (locked)
-          - beta-x86_64-apple-darwin (locked)
-          - beta-x86_64-unknown-linux-gnu (locked)
-          - beta-x86_64-unknown-linux-musl (locked)
+          - stable-x86_64-pc-windows-msvc
+          - stable-x86_64-apple-darwin
+          - stable-x86_64-unknown-linux-gnu
+          - stable-x86_64-unknown-linux-musl
+          - beta-x86_64-pc-windows-msvc
+          - beta-x86_64-apple-darwin
+          - beta-x86_64-unknown-linux-gnu
+          - beta-x86_64-unknown-linux-musl
         include:
-          - { name: stable-x86_64-pc-windows-msvc (locked)    , channel: stable, target-triple: x86_64-pc-windows-msvc   , host-triple: x86_64-pc-windows-msvc  , cargo-update: false, os: windows-2019 }
-          - { name: stable-x86_64-apple-darwin (locked)       , channel: stable, target-triple: x86_64-apple-darwin      , host-triple: x86_64-apple-darwin     , cargo-update: false, os: macos-10.15  }
-          - { name: stable-x86_64-unknown-linux-gnu (locked)  , channel: stable, target-triple: x86_64-unknown-linux-gnu , host-triple: x86_64-unknown-linux-gnu, cargo-update: false, os: ubuntu-18.04 }
-          - { name: stable-x86_64-unknown-linux-musl (locked) , channel: stable, target-triple: x86_64-unknown-linux-musl, host-triple: x86_64-unknown-linux-gnu, cargo-update: false, os: ubuntu-18.04 }
-          - { name: stable-x86_64-pc-windows-msvc (maximal)   , channel: stable, target-triple: x86_64-pc-windows-msvc   , host-triple: x86_64-pc-windows-msvc  , cargo-update: true , os: windows-2019 }
-          - { name: stable-x86_64-apple-darwin (maximal)      , channel: stable, target-triple: x86_64-apple-darwin      , host-triple: x86_64-apple-darwin     , cargo-update: true , os: macos-10.15  }
-          - { name: stable-x86_64-unknown-linux-gnu (maximal) , channel: stable, target-triple: x86_64-unknown-linux-gnu , host-triple: x86_64-unknown-linux-gnu, cargo-update: true , os: ubuntu-18.04 }
-          - { name: stable-x86_64-unknown-linux-musl (maximal), channel: stable, target-triple: x86_64-unknown-linux-musl, host-triple: x86_64-unknown-linux-gnu, cargo-update: true , os: ubuntu-18.04 }
-          - { name: beta-x86_64-pc-windows-msvc (locked)      , channel: beta  , target-triple: x86_64-pc-windows-msvc   , host-triple: x86_64-pc-windows-msvc  , cargo-update: false, os: windows-2019 }
-          - { name: beta-x86_64-apple-darwin (locked)         , channel: beta  , target-triple: x86_64-apple-darwin      , host-triple: x86_64-apple-darwin     , cargo-update: false, os: macos-10.15  }
-          - { name: beta-x86_64-unknown-linux-gnu (locked)    , channel: beta  , target-triple: x86_64-unknown-linux-gnu , host-triple: x86_64-unknown-linux-gnu, cargo-update: false, os: ubuntu-18.04 }
-          - { name: beta-x86_64-unknown-linux-musl (locked)   , channel: beta  , target-triple: x86_64-unknown-linux-musl, host-triple: x86_64-unknown-linux-gnu, cargo-update: false, os: ubuntu-18.04 }
+          - { name: stable-x86_64-pc-windows-msvc   , channel: stable, target-triple: x86_64-pc-windows-msvc   , host-triple: x86_64-pc-windows-msvc  , os: windows-2019 }
+          - { name: stable-x86_64-apple-darwin      , channel: stable, target-triple: x86_64-apple-darwin      , host-triple: x86_64-apple-darwin     , os: macos-10.15  }
+          - { name: stable-x86_64-unknown-linux-gnu , channel: stable, target-triple: x86_64-unknown-linux-gnu , host-triple: x86_64-unknown-linux-gnu, os: ubuntu-18.04 }
+          - { name: stable-x86_64-unknown-linux-musl, channel: stable, target-triple: x86_64-unknown-linux-musl, host-triple: x86_64-unknown-linux-gnu, os: ubuntu-18.04 }
+          - { name: beta-x86_64-pc-windows-msvc     , channel: beta  , target-triple: x86_64-pc-windows-msvc   , host-triple: x86_64-pc-windows-msvc  , os: windows-2019 }
+          - { name: beta-x86_64-apple-darwin        , channel: beta  , target-triple: x86_64-apple-darwin      , host-triple: x86_64-apple-darwin     , os: macos-10.15  }
+          - { name: beta-x86_64-unknown-linux-gnu   , channel: beta  , target-triple: x86_64-unknown-linux-gnu , host-triple: x86_64-unknown-linux-gnu, os: ubuntu-18.04 }
+          - { name: beta-x86_64-unknown-linux-musl  , channel: beta  , target-triple: x86_64-unknown-linux-musl, host-triple: x86_64-unknown-linux-gnu, os: ubuntu-18.04 }
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -116,12 +108,6 @@ jobs:
           default: true
           profile: default
 
-      - name: '`cargo update`'
-        uses: actions-rs/cargo@v1
-        with:
-          command: update
-        if: matrix.cargo-update
-
       - name: '`cargo clippy --target ${{ matrix.target-triple }} -v -- -D warnings`'
         uses: actions-rs/cargo@v1
         with:
@@ -139,6 +125,18 @@ jobs:
         with:
           command: build
           args: --target ${{ matrix.target-triple }} -v
+
+      - name: '`cargo install --path . --debug --target ${{ matrix.target-triple }} -v --locked`'
+        uses: actions-rs/cargo@v1
+        with:
+          command: install
+          args: --path . --debug --target ${{ matrix.target-triple }} -v --locked
+
+      - name: '`cargo install --path . --debug --target ${{ matrix.target-triple }} -v`'
+        uses: actions-rs/cargo@v1
+        with:
+          command: install
+          args: --path . --debug --target ${{ matrix.target-triple }} -v
 
   upload:
     strategy:
@@ -175,11 +173,11 @@ jobs:
           default: true
           profile: default
 
-      - name: '`cargo build --release --target ${{ matrix.target-triple }} -v`'
+      - name: '`cargo install --path . --target ${{ matrix.target-triple }} -v --locked`'
         uses: actions-rs/cargo@v1
         with:
-          command: build
-          args: --release --target ${{ matrix.target-triple }} -v
+          command: install
+          args: --path . --target ${{ matrix.target-triple }} -v --locked
 
       - name: Create an artifact
         id: artifact
@@ -188,7 +186,7 @@ jobs:
             DOT_EXE=.exe
           fi
           BIN_TARGET=cargo-scripts
-          EXECUTABLE="./target/${{ matrix.target-triple }}/release/$BIN_TARGET$DOT_EXE"
+          EXECUTABLE="$HOME/.cargo/bin/$BIN_TARGET$DOT_EXE"
           ARTIFACT_STEM="$BIN_TARGET-${GITHUB_REF#refs/tags/}-${{ matrix.target-triple }}"
           git archive -o "./$ARTIFACT_STEM.tar" --prefix "$ARTIFACT_STEM/" HEAD
           tar -xf "./$ARTIFACT_STEM.tar"
