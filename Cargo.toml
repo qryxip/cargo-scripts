@@ -16,6 +16,7 @@ _ = { package = "proc-macro2", version = "1.0.9", default-features = false, feat
 anyhow = "1.0.26"
 atty = "0.2.14"
 cargo_metadata = "0.9.1"
+diff = "0.1.12"
 duct = "0.13.3"
 human-panic = "1.0.1"
 if_chain = "1.0.0"
