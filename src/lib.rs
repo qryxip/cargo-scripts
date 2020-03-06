@@ -505,25 +505,8 @@ fn init_workspace(
 
     let path = ctx.cwd.join(path.strip_prefix(".").unwrap_or(&path));
 
-    if !dry_run {
-        static CARGO_TOML: &str = r#"[workspace]
-members = ["template"]
-exclude = []
-"#;
-
-        write(path.join("Cargo.toml"), CARGO_TOML)?;
-    }
-    info!("Wrote {}", path.join("Cargo.toml").display());
-
-    if !dry_run {
-        static CARGO_SCRIPTS_TOML: &str = r#"base = "./template"
-
-[gist_ids]
-"#;
-
-        write(path.join("cargo-scripts.toml"), CARGO_SCRIPTS_TOML)?;
-    }
-    info!("Wrote {}", path.join("cargo-scripts.toml").display());
+    write(path.join("Cargo.toml"), CARGO_TOML, dry_run)?;
+    write(path.join("cargo-scripts.toml"), CARGO_SCRIPTS_TOML, dry_run)?;
 
     let program = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let args = vec![
@@ -553,15 +536,26 @@ exclude = []
         write(
             path.join("template").join("Cargo.toml"),
             cargo_toml.to_string(),
+            true,
         )?;
     }
-    info!(
-        "Wrote {}",
-        path.join("template").join("Cargo.toml").display(),
+    return write(
+        path.join("template").join("src").join("main.rs"),
+        TEMPLATE_SRC_MAIN_RS,
+        dry_run,
     );
 
-    if !dry_run {
-        static TEMPLATE_SRC_MAIN_RS: &str = r#"#!/usr/bin/env run-cargo-script
+    static CARGO_TOML: &str = r#"[workspace]
+members = ["template"]
+exclude = []
+"#;
+
+    static CARGO_SCRIPTS_TOML: &str = r#"base = "./template"
+
+[gist_ids]
+"#;
+
+    static TEMPLATE_SRC_MAIN_RS: &str = r#"#!/usr/bin/env run-cargo-script
 //! This is a regular crate doc comment, but it also contains a partial
 //! Cargo manifest.  Note the use of a *fenced* code block, and the
 //! `cargo` "language".
@@ -574,17 +568,6 @@ fn main() {
     todo!();
 }
 "#;
-
-        write(
-            path.join("template").join("src").join("main.rs"),
-            TEMPLATE_SRC_MAIN_RS,
-        )?;
-    }
-    info!(
-        "Wrote {}",
-        path.join("template").join("src").join("main.rs").display(),
-    );
-    Ok(())
 }
 
 fn new(opt: OptScriptsNew, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result<()> {
@@ -614,13 +597,10 @@ fn new(opt: OptScriptsNew, ctx: Context<impl Sized, impl Sized>) -> anyhow::Resu
                 if !(src.is_dir() || src == base.join("Cargo.toml")) {
                     if let Some(parent) = dst.parent() {
                         if !parent.exists() {
-                            create_dir_all(parent)?;
+                            create_dir_all(parent, dry_run)?;
                         }
                     }
-                    if !dry_run {
-                        copy(src, &dst)?;
-                    }
-                    info!("Copied {} to {}", src.display(), dst.display());
+                    copy(src, &dst, dry_run)?;
                 }
             }
             Err(err) => warn!("{}", err),
@@ -638,10 +618,7 @@ fn new(opt: OptScriptsNew, ctx: Context<impl Sized, impl Sized>) -> anyhow::Resu
     modify_package_name(&mut cargo_toml, new_package_name)?;
 
     let dst_manifest_path = path.join("Cargo.toml");
-    if !dry_run {
-        write(&dst_manifest_path, cargo_toml.to_string())?;
-    }
-    info!("Wrote {}", dst_manifest_path.display());
+    write(&dst_manifest_path, cargo_toml.to_string(), dry_run)?;
 
     modify_ws(
         &workspace_root,
@@ -857,10 +834,7 @@ fn gist_pull(opt: OptScriptsGistPull, ctx: Context<impl Sized, impl Sized>) -> a
                 };
                 info!("│{}{}", pref, line);
             }
-            if !dry_run {
-                write(&path, edit)?;
-            }
-            info!("Wrote {}", path.display());
+            write(&path, edit, dry_run)?;
         }
     }
     Ok(())
@@ -1051,10 +1025,7 @@ fn modify_ws<'a>(
         }
     }
 
-    if !dry_run {
-        write(&manifest_path, cargo_toml.to_string())?;
-    }
-    info!("Wrote {}", manifest_path.display());
+    write(&manifest_path, cargo_toml.to_string(), dry_run)?;
     Ok(())
 }
 
@@ -1073,17 +1044,11 @@ fn import_script(
         .with_context(|| "missing `package.name`")?;
     let path = path(&package_name);
 
-    if !dry_run {
-        create_dir_all(&path)?;
-        write(path.join("Cargo.toml"), cargo_toml)?;
-    }
-    info!("Wrote {}", path.join("Cargo.toml").display());
+    create_dir_all(&path, dry_run)?;
+    write(path.join("Cargo.toml"), cargo_toml, dry_run)?;
 
-    if !dry_run {
-        create_dir_all(path.join("src"))?;
-        write(path.join("src").join("main.rs"), main_rs)?;
-    }
-    info!("Wrote {}", path.join("src").join("main.rs").display());
+    create_dir_all(path.join("src"), dry_run)?;
+    write(path.join("src").join("main.rs"), main_rs, dry_run)?;
 
     modify_ws(&workspace_root, Some(&*path), None, None, None, dry_run)?;
     Ok(package_name)
@@ -1323,22 +1288,42 @@ fn read_toml_edit(path: impl AsRef<Path>) -> anyhow::Result<toml_edit::Document>
         .with_context(|| format!("failed to parse the TOML file at {}", path.display()))
 }
 
-fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> anyhow::Result<()> {
+fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>, dry_run: bool) -> anyhow::Result<()> {
     let path = path.as_ref();
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+    if !dry_run {
+        fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    info!(
+        "{}Wrote {}",
+        if dry_run { "[dry-run] " } else { "" },
+        path.display(),
+    );
+    Ok(())
 }
 
-fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Result<()> {
+fn copy(src: impl AsRef<Path>, dst: impl AsRef<Path>, dry_run: bool) -> anyhow::Result<()> {
     let (src, dst) = (src.as_ref(), dst.as_ref());
-    fs::copy(src, dst)
-        .with_context(|| format!("failed to copy `{}` to `{}`", src.display(), dst.display()))
-        .map(drop)
+    if !dry_run {
+        fs::copy(src, dst).with_context(|| {
+            format!("failed to copy `{}` to `{}`", src.display(), dst.display())
+        })?;
+    }
+    info!(
+        "{}Copied {} to {}",
+        if dry_run { "[dry-run] " } else { "" },
+        src.display(),
+        dst.display(),
+    );
+    Ok(())
 }
 
-fn create_dir_all(path: impl AsRef<Path>) -> anyhow::Result<()> {
+fn create_dir_all(path: impl AsRef<Path>, dry_run: bool) -> anyhow::Result<()> {
     let path = path.as_ref();
-    fs::create_dir_all(path)
-        .with_context(|| format!("failed not create directory `{}`", path.display()))
+    if !dry_run {
+        fs::create_dir_all(path)
+            .with_context(|| format!("failed to create directory `{}`", path.display()))?;
+    }
+    Ok(())
 }
 
 trait MetadataExt {
@@ -1396,11 +1381,7 @@ impl CargoScriptsConfig {
     }
 
     fn store(&self, dry_run: bool) -> anyhow::Result<()> {
-        if !dry_run {
-            write(&self.path, &toml::to_string(self).unwrap())?;
-        }
-        info!("Wrote {}", self.path.display());
-        Ok(())
+        write(&self.path, &toml::to_string(self).unwrap(), dry_run)
     }
 }
 
