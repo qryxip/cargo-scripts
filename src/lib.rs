@@ -210,16 +210,16 @@ pub struct OptScriptsExport {
 
 #[derive(StructOpt, Debug)]
 pub enum OptScriptsGist {
-    /// Import a script from Gist
+    /// Clone a script from Gist
     #[structopt(author)]
-    Import(OptScriptsGistImport),
+    Clone(OptScriptsGistClone),
     /// Pull a script from Gist
     #[structopt(author)]
     Pull(OptScriptsGistPull),
 }
 
 #[derive(StructOpt, Debug)]
-pub struct OptScriptsGistImport {
+pub struct OptScriptsGistClone {
     /// [cargo] Path to Cargo.toml
     #[structopt(long, value_name("PATH"))]
     pub manifest_path: Option<PathBuf>,
@@ -390,7 +390,7 @@ pub fn run<R: Read, W: Write>(opt: Opt, ctx: Context<R, W>) -> anyhow::Result<()
         Opt::Scripts(OptScripts::Exclude(opt)) => exclude(opt, ctx),
         Opt::Scripts(OptScripts::Import(opt)) => import(opt, ctx),
         Opt::Scripts(OptScripts::Export(opt)) => export(opt, ctx),
-        Opt::Scripts(OptScripts::Gist(OptScriptsGist::Import(opt))) => gist_import(opt, ctx),
+        Opt::Scripts(OptScripts::Gist(OptScriptsGist::Clone(opt))) => gist_clone(opt, ctx),
         Opt::Scripts(OptScripts::Gist(OptScriptsGist::Pull(opt))) => gist_pull(opt, ctx),
     }
 }
@@ -689,11 +689,11 @@ fn export(opt: OptScriptsExport, mut ctx: Context<impl Sized, impl Write>) -> an
     ctx.stdout.flush().map_err(Into::into)
 }
 
-fn gist_import(
-    opt: OptScriptsGistImport,
+fn gist_clone(
+    opt: OptScriptsGistClone,
     ctx: Context<impl Sized, impl Sized>,
 ) -> anyhow::Result<()> {
-    let OptScriptsGistImport {
+    let OptScriptsGistClone {
         manifest_path,
         color,
         dry_run,
