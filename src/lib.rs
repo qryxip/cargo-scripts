@@ -10,6 +10,7 @@ use log::{info, warn, Level, LevelFilter, Log, Record};
 use once_cell::sync::OnceCell;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use structopt::clap::AppSettings;
 use structopt::StructOpt;
 use strum::{EnumString, EnumVariantNames, IntoStaticStr, VariantNames as _};
@@ -21,7 +22,7 @@ use url::Url;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Stdin, Stdout, Write};
+use std::io::{self, Read, Stdout, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -219,6 +220,9 @@ pub enum OptScriptsGist {
     /// Pull a script from Gist
     #[structopt(author)]
     Pull(OptScriptsGistPull),
+    /// Pull a script to Gist
+    #[structopt(author)]
+    Push(OptScriptsGistPush),
 }
 
 #[derive(StructOpt, Debug)]
@@ -261,6 +265,35 @@ pub struct OptScriptsGistPull {
     #[structopt(long)]
     pub dry_run: bool,
     /// The **name** of the package to export
+    pub package: String,
+}
+
+#[derive(StructOpt, Debug)]
+pub struct OptScriptsGistPush {
+    /// [cargo] Path to Cargo.toml
+    #[structopt(long, value_name("PATH"))]
+    pub manifest_path: Option<PathBuf>,
+    /// [cargo] Coloring
+    #[structopt(
+        long,
+        value_name("WHEN"),
+        possible_values(AnsiColorChoice::VARIANTS),
+        default_value("auto")
+    )]
+    pub color: AnsiColorChoice,
+    /// Dry run
+    #[structopt(long)]
+    pub dry_run: bool,
+    /// Create a new gist when `gist_ids.<package>` is not set
+    #[structopt(short("u"), long)]
+    pub set_upstream: bool,
+    /// Make the gist private when `--set-upstream` is enabled
+    #[structopt(long)]
+    pub private: bool,
+    /// Set the description of the gist
+    #[structopt(long)]
+    pub description: Option<String>,
+    /// The **name** of the package to push
     pub package: String,
 }
 
@@ -349,25 +382,40 @@ pub struct OptScriptsConfigRmGistId {
 }
 
 #[derive(Debug)]
-pub struct Context<R, W> {
+pub struct Context<W, I, P> {
     pub cwd: PathBuf,
-    pub stdin: R,
+    pub home_dir: Option<PathBuf>,
     pub stdout: W,
+    pub read_input: I,
+    pub read_password: P,
     pub init_logger: fn(AnsiColorChoice),
 }
 
-impl Context<Stdin, Stdout> {
+impl Context<Stdout, fn() -> io::Result<String>, fn(&str) -> io::Result<String>> {
     pub fn new() -> anyhow::Result<Self> {
         let cwd = env::current_dir()
             .with_context(|| "couldn't get the current directory of the process")?;
-        let (stdin, stdout) = (io::stdin(), io::stdout());
+        let home_dir = dirs::home_dir();
+        let stdout = io::stdout();
 
         return Ok(Self {
             cwd,
-            stdin,
+            home_dir,
             stdout,
+            read_input,
+            read_password,
             init_logger,
         });
+
+        fn read_input() -> io::Result<String> {
+            let mut input = "".to_owned();
+            io::stdin().read_to_string(&mut input)?;
+            Ok(input)
+        }
+
+        fn read_password(prompt: &str) -> io::Result<String> {
+            rpassword::read_password_from_tty(Some(prompt))
+        }
 
         fn init_logger(color: AnsiColorChoice) {
             const FILTER_LEVEL: LevelFilter = LevelFilter::Info;
@@ -468,7 +516,10 @@ pub enum AnsiColorChoice {
     Never,
 }
 
-pub fn run<R: Read, W: Write>(opt: Opt, ctx: Context<R, W>) -> anyhow::Result<()> {
+pub fn run<W: Write, I: FnOnce() -> io::Result<String>, P: FnMut(&str) -> io::Result<String>>(
+    opt: Opt,
+    ctx: Context<W, I, P>,
+) -> anyhow::Result<()> {
     match opt {
         Opt::Scripts(OptScripts::InitWorkspace(opt)) => init_workspace(opt, ctx),
         Opt::Scripts(OptScripts::New(opt)) => new(opt, ctx),
@@ -479,6 +530,7 @@ pub fn run<R: Read, W: Write>(opt: Opt, ctx: Context<R, W>) -> anyhow::Result<()
         Opt::Scripts(OptScripts::Export(opt)) => export(opt, ctx),
         Opt::Scripts(OptScripts::Gist(OptScriptsGist::Clone(opt))) => gist_clone(opt, ctx),
         Opt::Scripts(OptScripts::Gist(OptScriptsGist::Pull(opt))) => gist_pull(opt, ctx),
+        Opt::Scripts(OptScripts::Gist(OptScriptsGist::Push(opt))) => gist_push(opt, ctx),
         Opt::Scripts(OptScripts::Config(OptScriptsConfig::Set(OptScriptsConfigSet::Base(opt)))) => {
             config_set_base(opt, ctx)
         }
@@ -493,7 +545,7 @@ pub fn run<R: Read, W: Write>(opt: Opt, ctx: Context<R, W>) -> anyhow::Result<()
 
 fn init_workspace(
     opt: OptScriptsInitWorkspace,
-    ctx: Context<impl Sized, impl Sized>,
+    ctx: Context<impl Sized, impl Sized, impl Sized>,
 ) -> anyhow::Result<()> {
     let OptScriptsInitWorkspace {
         color,
@@ -501,12 +553,20 @@ fn init_workspace(
         path,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd,
+        home_dir,
+        init_logger,
+        ..
+    } = ctx;
 
-    let path = ctx.cwd.join(path.strip_prefix(".").unwrap_or(&path));
+    init_logger(color);
+
+    let path = cwd.join(path.strip_prefix(".").unwrap_or(&path));
 
     write(path.join("Cargo.toml"), CARGO_TOML, dry_run)?;
-    write(path.join("cargo-scripts.toml"), CARGO_SCRIPTS_TOML, dry_run)?;
+    CargoScriptsConfig::new(&path.join("cargo-scripts.toml"), home_dir.as_deref())?
+        .store(dry_run)?;
 
     let program = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let args = vec![
@@ -536,7 +596,7 @@ fn init_workspace(
         write(
             path.join("template").join("Cargo.toml"),
             cargo_toml.to_string(),
-            true,
+            false,
         )?;
     }
     return write(
@@ -548,11 +608,6 @@ fn init_workspace(
     static CARGO_TOML: &str = r#"[workspace]
 members = ["template"]
 exclude = []
-"#;
-
-    static CARGO_SCRIPTS_TOML: &str = r#"base = "./template"
-
-[gist_ids]
 "#;
 
     static TEMPLATE_SRC_MAIN_RS: &str = r#"#!/usr/bin/env run-cargo-script
@@ -570,7 +625,7 @@ fn main() {
 "#;
 }
 
-fn new(opt: OptScriptsNew, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result<()> {
+fn new(opt: OptScriptsNew, ctx: Context<impl Sized, impl Sized, impl Sized>) -> anyhow::Result<()> {
     let OptScriptsNew {
         manifest_path,
         color,
@@ -579,12 +634,16 @@ fn new(opt: OptScriptsNew, ctx: Context<impl Sized, impl Sized>) -> anyhow::Resu
         path,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
+
+    init_logger(color);
 
     let cargo_metadata::Metadata { workspace_root, .. } =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
 
-    let path = ctx.cwd.join(path.strip_prefix(".").unwrap_or(&path));
+    let path = cwd.join(path.strip_prefix(".").unwrap_or(&path));
     let CargoScriptsConfig { base, .. } = CargoScriptsConfig::load(&workspace_root)?;
     let base = Path::new(&base);
     let base = workspace_root.join(base.strip_prefix(".").unwrap_or(base));
@@ -630,7 +689,7 @@ fn new(opt: OptScriptsNew, ctx: Context<impl Sized, impl Sized>) -> anyhow::Resu
     )
 }
 
-fn rm(opt: OptScriptsRm, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result<()> {
+fn rm(opt: OptScriptsRm, ctx: Context<impl Sized, impl Sized, impl Sized>) -> anyhow::Result<()> {
     let OptScriptsRm {
         manifest_path,
         color,
@@ -638,10 +697,13 @@ fn rm(opt: OptScriptsRm, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result
         package,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
 
-    let metadata =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+    init_logger(color);
+
+    let metadata = cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
     let package = metadata.find_package(&package)?;
     let dir = package
         .manifest_path
@@ -664,7 +726,10 @@ fn rm(opt: OptScriptsRm, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result
     Ok(())
 }
 
-fn include(opt: OptScriptsInclude, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result<()> {
+fn include(
+    opt: OptScriptsInclude,
+    ctx: Context<impl Sized, impl Sized, impl Sized>,
+) -> anyhow::Result<()> {
     let OptScriptsInclude {
         manifest_path,
         color,
@@ -672,11 +737,15 @@ fn include(opt: OptScriptsInclude, ctx: Context<impl Sized, impl Sized>) -> anyh
         path,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
+
+    init_logger(color);
 
     let cargo_metadata::Metadata { workspace_root, .. } =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
-    let path = ctx.cwd.join(path);
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
+    let path = cwd.join(path);
 
     modify_ws(
         &workspace_root,
@@ -688,7 +757,10 @@ fn include(opt: OptScriptsInclude, ctx: Context<impl Sized, impl Sized>) -> anyh
     )
 }
 
-fn exclude(opt: OptScriptsExclude, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result<()> {
+fn exclude(
+    opt: OptScriptsExclude,
+    ctx: Context<impl Sized, impl Sized, impl Sized>,
+) -> anyhow::Result<()> {
     let OptScriptsExclude {
         manifest_path,
         color,
@@ -696,11 +768,15 @@ fn exclude(opt: OptScriptsExclude, ctx: Context<impl Sized, impl Sized>) -> anyh
         path,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
+
+    init_logger(color);
 
     let cargo_metadata::Metadata { workspace_root, .. } =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
-    let path = ctx.cwd.join(path);
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
+    let path = cwd.join(path);
 
     modify_ws(
         &workspace_root,
@@ -712,7 +788,10 @@ fn exclude(opt: OptScriptsExclude, ctx: Context<impl Sized, impl Sized>) -> anyh
     )
 }
 
-fn import(opt: OptScriptsImport, mut ctx: Context<impl Read, impl Sized>) -> anyhow::Result<()> {
+fn import(
+    opt: OptScriptsImport,
+    ctx: Context<impl Sized, impl FnOnce() -> io::Result<String>, impl Sized>,
+) -> anyhow::Result<()> {
     let OptScriptsImport {
         manifest_path,
         color,
@@ -721,35 +800,46 @@ fn import(opt: OptScriptsImport, mut ctx: Context<impl Read, impl Sized>) -> any
         file,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd,
+        read_input,
+        init_logger,
+        ..
+    } = ctx;
+
+    init_logger(color);
 
     let cargo_metadata::Metadata { workspace_root, .. } =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
 
-    let content = file.as_ref().map(read).unwrap_or_else(|| {
-        let mut content = "".to_owned();
-        ctx.stdin.read_to_string(&mut content)?;
-        Ok(content)
-    })?;
+    let content = file
+        .as_ref()
+        .map(read)
+        .unwrap_or_else(move || read_input().map_err(Into::into))?;
 
     import_script(&workspace_root, &content, dry_run, |package_name| {
-        ctx.cwd
-            .join(path.unwrap_or_else(|| workspace_root.join(package_name)))
+        cwd.join(path.unwrap_or_else(|| workspace_root.join(package_name)))
     })
     .map(drop)
 }
 
-fn export(opt: OptScriptsExport, mut ctx: Context<impl Sized, impl Write>) -> anyhow::Result<()> {
+fn export(
+    opt: OptScriptsExport,
+    mut ctx: Context<impl Write, impl Sized, impl Sized>,
+) -> anyhow::Result<()> {
     let OptScriptsExport {
         manifest_path,
         color,
         package,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
 
-    let metadata =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+    init_logger(color);
+
+    let metadata = cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
     let (src_path, cargo_toml) = metadata.find_package(&package)?.find_default_bin()?;
     let (code, _) = replace_cargo_lang_code(&read(src_path)?, &cargo_toml, || {
         anyhow!(
@@ -764,7 +854,7 @@ fn export(opt: OptScriptsExport, mut ctx: Context<impl Sized, impl Write>) -> an
 
 fn gist_clone(
     opt: OptScriptsGistClone,
-    ctx: Context<impl Sized, impl Sized>,
+    ctx: Context<impl Sized, impl Sized, impl Sized>,
 ) -> anyhow::Result<()> {
     let OptScriptsGistClone {
         manifest_path,
@@ -774,17 +864,20 @@ fn gist_clone(
         gist_id,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
+
+    init_logger(color);
 
     let cargo_metadata::Metadata { workspace_root, .. } =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
 
     let mut config = CargoScriptsConfig::load(&workspace_root)?;
 
-    let script = retrieve_rust_code(&gist_id)?;
+    let (script, _) = retrieve_rust_code(&gist_id)?;
     let package_name = import_script(&workspace_root, &script, dry_run, |package_name| {
-        ctx.cwd
-            .join(path.unwrap_or_else(|| workspace_root.join(package_name)))
+        cwd.join(path.unwrap_or_else(|| workspace_root.join(package_name)))
     })?;
     let old_gist_id = config.gist_ids.get(&package_name).cloned();
     info!(
@@ -796,7 +889,10 @@ fn gist_clone(
     Ok(())
 }
 
-fn gist_pull(opt: OptScriptsGistPull, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result<()> {
+fn gist_pull(
+    opt: OptScriptsGistPull,
+    ctx: Context<impl Sized, impl Sized, impl Sized>,
+) -> anyhow::Result<()> {
     let OptScriptsGistPull {
         manifest_path,
         color,
@@ -804,17 +900,20 @@ fn gist_pull(opt: OptScriptsGistPull, ctx: Context<impl Sized, impl Sized>) -> a
         package,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
 
-    let metadata =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+    init_logger(color);
+
+    let metadata = cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
     let package = metadata.find_package(&package)?;
 
     let CargoScriptsConfig { gist_ids, .. } = CargoScriptsConfig::load(&metadata.workspace_root)?;
     let gist_id = gist_ids
         .get(&package.name)
         .ok_or_else(|| anyhow!("could not find the `gist_id` for {:?}", package.name))?;
-    let pulled_code = retrieve_rust_code(gist_id)?;
+    let (pulled_code, _) = retrieve_rust_code(gist_id)?;
     let (pulled_code, pulled_cargo_toml) = replace_cargo_lang_code_with_default(&pulled_code)?;
     let (src_path, prev_cargo_toml) = package.find_default_bin()?;
 
@@ -840,9 +939,160 @@ fn gist_pull(opt: OptScriptsGistPull, ctx: Context<impl Sized, impl Sized>) -> a
     Ok(())
 }
 
+fn gist_push(
+    opt: OptScriptsGistPush,
+    ctx: Context<impl Sized, impl Sized, impl FnMut(&str) -> io::Result<String>>,
+) -> anyhow::Result<()> {
+    let OptScriptsGistPush {
+        manifest_path,
+        color,
+        dry_run,
+        set_upstream,
+        private,
+        description,
+        package,
+    } = opt;
+
+    let Context {
+        cwd,
+        home_dir,
+        read_password,
+        init_logger,
+        ..
+    } = ctx;
+
+    init_logger(color);
+
+    let metadata = cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
+    let mut config = CargoScriptsConfig::load(&metadata.workspace_root)?;
+    let github_token = CargoScriptsConfig::load(&metadata.workspace_root)?
+        .github_token
+        .load_or_ask(dry_run, home_dir.as_deref(), read_password)?;
+
+    let (src_path, cargo_toml) = metadata.find_package(&package)?.find_default_bin()?;
+    let (local, _) = replace_cargo_lang_code(&read(src_path)?, &cargo_toml, || {
+        anyhow!(
+            "could not find the `cargo` code block: {}",
+            src_path.display(),
+        )
+    })?;
+
+    let state = if let Some(gist_id) = config.gist_ids.get(&package) {
+        let (remote_code, remote_description) = retrieve_rust_code(gist_id)?;
+        if remote_code == local {
+            State::UpToDate
+        } else {
+            State::Forward(gist_id, remote_description)
+        }
+    } else {
+        State::NotExist
+    };
+
+    return match state {
+        State::UpToDate => {
+            info!("Up to date");
+            Ok(())
+        }
+        State::Forward(gist_id, remote_description) => {
+            let url = "https://api.github.com/gists/"
+                .parse::<Url>()
+                .unwrap()
+                .join(gist_id)?;
+
+            if dry_run {
+                info!("[dry-run] PATCH {}", url);
+            } else {
+                let payload = json!({
+                    "description": description.unwrap_or(remote_description),
+                    "files": {
+                        format!("{}.rs", package): {
+                          "content": local
+                        }
+                    }
+                });
+
+                info!("PATCH {}", url);
+                let res = ureq::patch(url.as_ref())
+                    .set("Authorization", &format!("token {}", github_token))
+                    .set("User-Agent", USER_AGENT)
+                    .send_json(payload);
+                raise_synthetic_error(&res)?;
+                info!("{} {}", res.status(), res.status_text());
+                ensure!(res.status() == 200, "expected 200");
+                serde_json::from_str::<serde_json::Value>(&res.into_string()?)?;
+
+                info!("Updated `{}`", gist_id);
+            }
+            Ok(())
+        }
+        State::NotExist => {
+            static URL: &str = "https://api.github.com/gists";
+
+            if !set_upstream {
+                bail!("to create a new gist, enable `--set-upstream`");
+            } else if dry_run {
+                info!("[dry-run] POST {}", URL);
+                Ok(())
+            } else {
+                let payload = json!({
+                    "files": {
+                        format!("{}.rs", package): {
+                          "content": local
+                        }
+                    },
+                    "description": description.unwrap_or_default(),
+                    "public": !private
+                });
+
+                info!("POST {}", URL);
+                let res = ureq::post(URL)
+                    .set("Authorization", &format!("token {}", github_token))
+                    .set("User-Agent", USER_AGENT)
+                    .send_json(payload);
+                raise_synthetic_error(&res)?;
+                ensure!(res.status() == 201, "expected 201");
+                let CreateGist { id } = serde_json::from_str(&res.into_string()?)?;
+
+                info!("Created `{}`", id);
+                info!(
+                    "`gist_ids.{:?}`: {:?} →> {:?}",
+                    package,
+                    config.gist_ids.get(&package),
+                    id,
+                );
+                config.gist_ids.insert(package, id);
+                config.store(false)
+            }
+        }
+    };
+
+    enum State<'a> {
+        UpToDate,
+        Forward(&'a str, String),
+        NotExist,
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct CreateGist {
+        id: String,
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct Gist {
+        files: IndexMap<String, GistFile>,
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct GistFile {
+        filename: String,
+        truncated: bool,
+        content: String,
+    }
+}
+
 fn config_set_base(
     opt: OptScriptsConfigSetBase,
-    ctx: Context<impl Sized, impl Sized>,
+    ctx: Context<impl Sized, impl Sized, impl Sized>,
 ) -> anyhow::Result<()> {
     let OptScriptsConfigSetBase {
         manifest_path,
@@ -851,10 +1101,14 @@ fn config_set_base(
         path,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
+
+    init_logger(color);
 
     let cargo_metadata::Metadata { workspace_root, .. } =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
     let mut config = CargoScriptsConfig::load(&workspace_root)?;
     info!("`base`: {:?} → {:?}", config.base, path);
     config.base = path;
@@ -864,7 +1118,7 @@ fn config_set_base(
 
 fn config_set_gist_id(
     opt: OptScriptsConfigSetGistId,
-    ctx: Context<impl Sized, impl Sized>,
+    ctx: Context<impl Sized, impl Sized, impl Sized>,
 ) -> anyhow::Result<()> {
     let OptScriptsConfigSetGistId {
         manifest_path,
@@ -874,10 +1128,14 @@ fn config_set_gist_id(
         gist_id,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
+
+    init_logger(color);
 
     let cargo_metadata::Metadata { workspace_root, .. } =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
     let mut config = CargoScriptsConfig::load(&workspace_root)?;
     info!(
         "`gist_ids.{:?}`: {:?} → {:?}",
@@ -892,7 +1150,7 @@ fn config_set_gist_id(
 
 fn config_remove_gist_id(
     opt: OptScriptsConfigRmGistId,
-    ctx: Context<impl Sized, impl Sized>,
+    ctx: Context<impl Sized, impl Sized, impl Sized>,
 ) -> anyhow::Result<()> {
     let OptScriptsConfigRmGistId {
         manifest_path,
@@ -901,10 +1159,14 @@ fn config_remove_gist_id(
         package,
     } = opt;
 
-    (ctx.init_logger)(color);
+    let Context {
+        cwd, init_logger, ..
+    } = ctx;
+
+    init_logger(color);
 
     let cargo_metadata::Metadata { workspace_root, .. } =
-        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &cwd)?;
     let mut config = CargoScriptsConfig::load(&workspace_root)?;
     config.gist_ids.remove(&package);
     info!("Removed `gist_ids.{:?}`", package);
@@ -1195,12 +1457,19 @@ fn replace_cargo_lang_code(
     }
 }
 
-fn retrieve_rust_code(gist_id: &str) -> anyhow::Result<String> {
+fn retrieve_rust_code(gist_id: &str) -> anyhow::Result<(String, String)> {
     let url = "https://api.github.com/gists/"
         .parse::<Url>()
         .unwrap()
         .join(&gist_id)?;
-    let Gist { files } = http_get_json(&url)?;
+
+    info!("GET: {}", url);
+    let res = ureq::get(url.as_ref()).set("User-Agent", USER_AGENT).call();
+    raise_synthetic_error(&res)?;
+    info!("{} {}", res.status(), res.status_text());
+    ensure!(res.status() == 200, "expected 200");
+
+    let Gist { files, description } = serde_json::from_str(&res.into_string()?)?;
 
     let file = files
         .values()
@@ -1224,11 +1493,12 @@ fn retrieve_rust_code(gist_id: &str) -> anyhow::Result<String> {
         bail!("{} is truncated", file.filename);
     }
 
-    return Ok(file.content.clone());
+    return Ok((file.content.clone(), description));
 
     #[derive(Deserialize)]
     struct Gist {
         files: IndexMap<String, GistFile>,
+        description: String,
     }
 
     #[derive(Deserialize, Debug)]
@@ -1239,16 +1509,7 @@ fn retrieve_rust_code(gist_id: &str) -> anyhow::Result<String> {
     }
 }
 
-fn http_get_json<T: DeserializeOwned>(url: &Url) -> anyhow::Result<T> {
-    info!("GET: {}", url);
-    let res = ureq::get(url.as_ref()).set("User-Agent", USER_AGENT).call();
-    raise_synthetic_error(&res)?;
-    info!("{} {}", res.status(), res.status_text());
-    ensure!(res.status() == 200, "expected 200");
-    return serde_json::from_str(&res.into_string()?).map_err(Into::into);
-
-    static USER_AGENT: &str = "cargo-scripts <https://github.com/qryxip/cargo-scripts>";
-}
+static USER_AGENT: &str = "cargo-scripts <https://github.com/qryxip/cargo-scripts>";
 
 fn raise_synthetic_error(res: &Response) -> anyhow::Result<()> {
     if let Some(err) = res.synthetic_error() {
@@ -1367,6 +1628,7 @@ impl PakcageExt for Package {
 #[derive(Deserialize, Serialize, Debug)]
 struct CargoScriptsConfig {
     base: String,
+    github_token: CargoScriptsConfigGithubToken,
     #[serde(default)]
     gist_ids: BTreeMap<String, String>,
     #[serde(skip)]
@@ -1374,6 +1636,33 @@ struct CargoScriptsConfig {
 }
 
 impl CargoScriptsConfig {
+    fn new(path: &Path, home_dir: Option<&Path>) -> anyhow::Result<Self> {
+        let github_token = CargoScriptsConfigGithubToken::File {
+            path: {
+                let path = dirs::data_local_dir()
+                    .with_context(|| "local data directory not found")?
+                    .join("cargo-scripts")
+                    .join("github-token")
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|s| anyhow!("{:?} is not valid UTF-8", s))?;
+                let home_dir = shellexpand::tilde_with_context("~", || home_dir);
+                if !home_dir.is_empty() && path.starts_with(&*home_dir) {
+                    format!("~{}", path.trim_start_matches(&*home_dir))
+                } else {
+                    path
+                }
+            },
+        };
+
+        Ok(Self {
+            base: "./template".to_owned(),
+            github_token,
+            gist_ids: BTreeMap::new(),
+            path: path.to_owned(),
+        })
+    }
+
     fn load(workspace_root: &Path) -> anyhow::Result<Self> {
         let path = workspace_root.join("cargo-scripts.toml");
         let (_, this) = read_toml(&path)?;
@@ -1382,6 +1671,34 @@ impl CargoScriptsConfig {
 
     fn store(&self, dry_run: bool) -> anyhow::Result<()> {
         write(&self.path, &toml::to_string(self).unwrap(), dry_run)
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(tag = "kind")]
+enum CargoScriptsConfigGithubToken {
+    File { path: String },
+}
+
+impl CargoScriptsConfigGithubToken {
+    fn load_or_ask(
+        &self,
+        dry_run: bool,
+        home_dir: Option<&Path>,
+        mut ask: impl FnMut(&str) -> io::Result<String>,
+    ) -> anyhow::Result<String> {
+        let Self::File { path } = self;
+        let path = shellexpand::tilde_with_context(path, || home_dir);
+        if Path::new(&*path).exists() {
+            read(&*path)
+        } else {
+            let token = ask("GitHub token: ")?;
+            if let Some(parent) = Path::new(&*path).parent() {
+                create_dir_all(parent, dry_run)?;
+            }
+            write(&*path, &token, dry_run)?;
+            Ok(token)
+        }
     }
 }
 
