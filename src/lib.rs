@@ -15,6 +15,7 @@ use structopt::StructOpt;
 use strum::{EnumString, EnumVariantNames, IntoStaticStr, VariantNames as _};
 use syn::{Lit, Meta, MetaNameValue};
 use termcolor::{BufferedStandardStream, Color, ColorSpec, WriteColor};
+use ureq::Response;
 use url::Url;
 
 use std::borrow::Cow;
@@ -212,6 +213,9 @@ pub enum OptScriptsGist {
     /// Import a script from Gist
     #[structopt(author)]
     Import(OptScriptsGistImport),
+    /// Pull a script from Gist
+    #[structopt(author)]
+    Pull(OptScriptsGistPull),
 }
 
 #[derive(StructOpt, Debug)]
@@ -235,6 +239,26 @@ pub struct OptScriptsGistImport {
     pub path: Option<PathBuf>,
     /// Gist ID
     pub gist_id: String,
+}
+
+#[derive(StructOpt, Debug)]
+pub struct OptScriptsGistPull {
+    /// [cargo] Path to Cargo.toml
+    #[structopt(long, value_name("PATH"))]
+    pub manifest_path: Option<PathBuf>,
+    /// [cargo] Coloring
+    #[structopt(
+        long,
+        value_name("WHEN"),
+        possible_values(AnsiColorChoice::VARIANTS),
+        default_value("auto")
+    )]
+    pub color: AnsiColorChoice,
+    /// Dry run
+    #[structopt(long)]
+    pub dry_run: bool,
+    /// The **name** of the package to export
+    pub package: String,
 }
 
 #[derive(Debug)]
@@ -367,6 +391,7 @@ pub fn run<R: Read, W: Write>(opt: Opt, ctx: Context<R, W>) -> anyhow::Result<()
         Opt::Scripts(OptScripts::Import(opt)) => import(opt, ctx),
         Opt::Scripts(OptScripts::Export(opt)) => export(opt, ctx),
         Opt::Scripts(OptScripts::Gist(OptScriptsGist::Import(opt))) => gist_import(opt, ctx),
+        Opt::Scripts(OptScripts::Gist(OptScriptsGist::Pull(opt))) => gist_pull(opt, ctx),
     }
 }
 
@@ -652,25 +677,8 @@ fn export(opt: OptScriptsExport, mut ctx: Context<impl Sized, impl Write>) -> an
 
     let metadata =
         cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
-
-    let package = metadata.find_package(&package)?;
-
-    let (cargo_toml_str, cargo_toml_value) = read_toml::<_, CargoToml>(&package.manifest_path)?;
-    let default_run = cargo_toml_value.package.default_run.as_ref();
-
-    let Target { src_path, .. } = package
-        .targets
-        .iter()
-        .filter(|Target { kind, name, .. }| {
-            kind.contains(&"bin".to_owned()) && default_run.map_or(true, |d| d == name)
-        })
-        .exactly_one()
-        .map_err(|err| match err.count() {
-            0 => anyhow!("no `bin` targets found"),
-            _ => anyhow!("could not determine which `bin` target to export"),
-        })?;
-
-    let (code, _) = replace_cargo_lang_code(&read(src_path)?, &cargo_toml_str, || {
+    let (src_path, cargo_toml) = metadata.find_package(&package)?.find_default_bin()?;
+    let (code, _) = replace_cargo_lang_code(&read(src_path)?, &cargo_toml, || {
         anyhow!(
             "could not find the `cargo` code block: {}",
             src_path.display(),
@@ -700,54 +708,8 @@ fn gist_import(
 
     let mut config = CargoScriptsConfig::load(&workspace_root)?;
 
-    let url = "https://api.github.com/gists/"
-        .parse::<Url>()
-        .unwrap()
-        .join(&gist_id)?;
-
-    info!("GET: {}", url);
-    let res = ureq::get(url.as_ref()).set("User-Agent", USER_AGENT).call();
-
-    if let Some(err) = res.synthetic_error() {
-        let mut err = err as &dyn std::error::Error;
-        let mut displays = vec![err.to_string()];
-        while let Some(source) = err.source() {
-            displays.push(source.to_string());
-            err = source;
-        }
-        let mut displays = displays.into_iter().rev();
-        let cause = anyhow!("{}", displays.next().unwrap());
-        return Err(displays.fold(cause, |err, display| err.context(display)));
-    }
-
-    info!("{} {}", res.status(), res.status_text());
-    ensure!(res.status() == 200, "expected 200");
-
-    let Gist { files } = serde_json::from_str(&res.into_string()?)?;
-
-    let file = files
-        .values()
-        .filter(|GistFile { filename, .. }| {
-            [Some("rs".as_ref()), Some("crs".as_ref())].contains(&Path::new(&filename).extension())
-        })
-        .exactly_one()
-        .map_err(|err| {
-            let mut err = err.peekable();
-            if err.peek().is_some() {
-                anyhow!(
-                    "multiple Rust files: [{}]",
-                    err.format_with(", ", |GistFile { filename, .. }, f| f(&filename)),
-                )
-            } else {
-                anyhow!("no Rust files found")
-            }
-        })?;
-
-    if file.truncated {
-        bail!("{} is truncated", file.filename);
-    }
-
-    let package_name = import_script(&workspace_root, &file.content, dry_run, |package_name| {
+    let script = retrieve_rust_code(&gist_id)?;
+    let package_name = import_script(&workspace_root, &script, dry_run, |package_name| {
         ctx.cwd
             .join(path.unwrap_or_else(|| workspace_root.join(package_name)))
     })?;
@@ -760,21 +722,54 @@ fn gist_import(
     if !dry_run {
         config.store(&workspace_root)?;
     }
-    return Ok(());
+    Ok(())
+}
 
-    static USER_AGENT: &str = "cargo-scripts <https://github.com/qryxip/cargo-scripts>";
+fn gist_pull(opt: OptScriptsGistPull, ctx: Context<impl Sized, impl Sized>) -> anyhow::Result<()> {
+    let OptScriptsGistPull {
+        manifest_path,
+        color,
+        dry_run,
+        package,
+    } = opt;
 
-    #[derive(Deserialize)]
-    struct Gist {
-        files: IndexMap<String, GistFile>,
+    (ctx.init_logger)(color);
+
+    let metadata =
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+    let package = metadata.find_package(&package)?;
+
+    let CargoScriptsConfig { gist_ids, .. } = CargoScriptsConfig::load(&metadata.workspace_root)?;
+    let gist_id = gist_ids
+        .get(&package.name)
+        .ok_or_else(|| anyhow!("could not find the `gist_id` for {:?}", package.name))?;
+    let pulled_code = retrieve_rust_code(gist_id)?;
+    let (pulled_code, pulled_cargo_toml) = replace_cargo_lang_code_with_default(&pulled_code)?;
+    let (src_path, prev_cargo_toml) = package.find_default_bin()?;
+
+    for (path, orig, edit) in &[
+        (src_path, read(src_path)?, pulled_code),
+        (&package.manifest_path, prev_cargo_toml, pulled_cargo_toml),
+    ] {
+        if orig == edit {
+            info!("No changes: {}", path.display());
+        } else {
+            info!("`{}`:", path.display());
+            for diff in diff::lines(orig, edit) {
+                let (pref, line) = match diff {
+                    diff::Result::Left(l) => ("-", l),
+                    diff::Result::Both(l, _) => (" ", l),
+                    diff::Result::Right(l) => ("+", l),
+                };
+                info!("│{}{}", pref, line);
+            }
+            if !dry_run {
+                write(&path, edit)?;
+            }
+            info!("Wrote {}", path.display());
+        }
     }
-
-    #[derive(Deserialize, Debug)]
-    struct GistFile {
-        filename: String,
-        truncated: bool,
-        content: String,
-    }
+    Ok(())
 }
 
 fn cargo_metadata_no_deps_expecting_virtual(
@@ -903,11 +898,7 @@ fn import_script(
     dry_run: bool,
     path: impl FnOnce(&str) -> PathBuf,
 ) -> anyhow::Result<String> {
-    static MANIFEST: &str = "# Leave blank.";
-
-    let (main_rs, cargo_toml) = replace_cargo_lang_code(script, MANIFEST, || {
-        anyhow!("could not find the `cargo` code block")
-    })?;
+    let (main_rs, cargo_toml) = replace_cargo_lang_code_with_default(script)?;
 
     let package_name = toml::from_str::<CargoToml>(&cargo_toml)
         .with_context(|| "failed to parse the manifest")?
@@ -930,6 +921,14 @@ fn import_script(
 
     modify_ws(&workspace_root, Some(&*path), None, None, None, dry_run)?;
     Ok(package_name)
+}
+
+fn replace_cargo_lang_code_with_default(code: &str) -> anyhow::Result<(String, String)> {
+    return replace_cargo_lang_code(code, MANIFEST, || {
+        anyhow!("could not find the `cargo` code block")
+    });
+
+    static MANIFEST: &str = "# Leave blank.";
 }
 
 fn replace_cargo_lang_code(
@@ -1065,6 +1064,76 @@ fn replace_cargo_lang_code(
     }
 }
 
+fn retrieve_rust_code(gist_id: &str) -> anyhow::Result<String> {
+    let url = "https://api.github.com/gists/"
+        .parse::<Url>()
+        .unwrap()
+        .join(&gist_id)?;
+    let Gist { files } = http_get_json(&url)?;
+
+    let file = files
+        .values()
+        .filter(|GistFile { filename, .. }| {
+            [Some("rs".as_ref()), Some("crs".as_ref())].contains(&Path::new(&filename).extension())
+        })
+        .exactly_one()
+        .map_err(|err| {
+            let mut err = err.peekable();
+            if err.peek().is_some() {
+                anyhow!(
+                    "multiple Rust files: [{}]",
+                    err.format_with(", ", |GistFile { filename, .. }, f| f(&filename)),
+                )
+            } else {
+                anyhow!("no Rust files found")
+            }
+        })?;
+
+    if file.truncated {
+        bail!("{} is truncated", file.filename);
+    }
+
+    return Ok(file.content.clone());
+
+    #[derive(Deserialize)]
+    struct Gist {
+        files: IndexMap<String, GistFile>,
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct GistFile {
+        filename: String,
+        truncated: bool,
+        content: String,
+    }
+}
+
+fn http_get_json<T: DeserializeOwned>(url: &Url) -> anyhow::Result<T> {
+    info!("GET: {}", url);
+    let res = ureq::get(url.as_ref()).set("User-Agent", USER_AGENT).call();
+    raise_synthetic_error(&res)?;
+    info!("{} {}", res.status(), res.status_text());
+    ensure!(res.status() == 200, "expected 200");
+    return serde_json::from_str(&res.into_string()?).map_err(Into::into);
+
+    static USER_AGENT: &str = "cargo-scripts <https://github.com/qryxip/cargo-scripts>";
+}
+
+fn raise_synthetic_error(res: &Response) -> anyhow::Result<()> {
+    if let Some(err) = res.synthetic_error() {
+        let mut err = err as &dyn std::error::Error;
+        let mut displays = vec![err.to_string()];
+        while let Some(source) = err.source() {
+            displays.push(source.to_string());
+            err = source;
+        }
+        let mut displays = displays.into_iter().rev();
+        let cause = anyhow!("{}", displays.next().unwrap());
+        return Err(displays.fold(cause, |err, display| err.context(display)));
+    }
+    Ok(())
+}
+
 fn read(path: impl AsRef<Path>) -> anyhow::Result<String> {
     let path = path.as_ref();
     fs::read_to_string(path).map_err(|err| match err.kind() {
@@ -1116,6 +1185,31 @@ impl MetadataExt for cargo_metadata::Metadata {
             .iter()
             .find(|p| p.name == name)
             .with_context(|| format!("no such package: {:?}", name))
+    }
+}
+
+trait PakcageExt {
+    fn find_default_bin(&self) -> anyhow::Result<(&Path, String)>;
+}
+
+impl PakcageExt for Package {
+    fn find_default_bin(&self) -> anyhow::Result<(&Path, String)> {
+        let (cargo_toml_str, cargo_toml_value) = read_toml::<_, CargoToml>(&self.manifest_path)?;
+        let default_run = cargo_toml_value.package.default_run.as_ref();
+
+        let Target { src_path, .. } = self
+            .targets
+            .iter()
+            .filter(|Target { kind, name, .. }| {
+                kind.contains(&"bin".to_owned()) && default_run.map_or(true, |d| d == name)
+            })
+            .exactly_one()
+            .map_err(|err| match err.count() {
+                0 => anyhow!("no `bin` targets found"),
+                _ => anyhow!("could not determine which `bin` target to export"),
+            })?;
+
+        Ok((src_path, cargo_toml_str))
     }
 }
 
