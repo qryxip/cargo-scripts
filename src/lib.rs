@@ -65,6 +65,9 @@ pub enum OptScripts {
     /// Gist
     #[structopt(author)]
     Gist(OptScriptsGist),
+    /// Modify cargo-scripts.toml
+    #[structopt(author)]
+    Config(OptScriptsConfig),
 }
 
 #[derive(StructOpt, Debug)]
@@ -261,6 +264,90 @@ pub struct OptScriptsGistPull {
     pub package: String,
 }
 
+#[derive(StructOpt, Debug)]
+pub enum OptScriptsConfig {
+    /// Set a variable of cargo-scripts.toml
+    Set(OptScriptsConfigSet),
+    /// Remove a variable from cargo-scripts.toml
+    Remove(OptScriptsConfigRemove),
+}
+
+#[derive(StructOpt, Debug)]
+pub enum OptScriptsConfigSet {
+    /// Set `base`
+    Base(OptScriptsConfigSetBase),
+    /// Set `gist_id.<package>`
+    GistId(OptScriptsConfigSetGistId),
+}
+
+#[derive(StructOpt, Debug)]
+pub struct OptScriptsConfigSetBase {
+    /// [cargo] Path to Cargo.toml
+    #[structopt(long, value_name("PATH"))]
+    pub manifest_path: Option<PathBuf>,
+    /// [cargo] Coloring
+    #[structopt(
+        long,
+        value_name("WHEN"),
+        possible_values(AnsiColorChoice::VARIANTS),
+        default_value("auto")
+    )]
+    pub color: AnsiColorChoice,
+    /// Dry run
+    #[structopt(long)]
+    pub dry_run: bool,
+    /// Value
+    pub path: String,
+}
+
+#[derive(StructOpt, Debug)]
+pub struct OptScriptsConfigSetGistId {
+    /// [cargo] Path to Cargo.toml
+    #[structopt(long, value_name("PATH"))]
+    pub manifest_path: Option<PathBuf>,
+    /// [cargo] Coloring
+    #[structopt(
+        long,
+        value_name("WHEN"),
+        possible_values(AnsiColorChoice::VARIANTS),
+        default_value("auto")
+    )]
+    pub color: AnsiColorChoice,
+    /// Dry run
+    #[structopt(long)]
+    pub dry_run: bool,
+    /// Key (Package **name**)
+    pub package: String,
+    /// Value
+    pub gist_id: String,
+}
+
+#[derive(StructOpt, Debug)]
+pub enum OptScriptsConfigRemove {
+    /// Remove `gist_id.<package>`
+    GistId(OptScriptsConfigRmGistId),
+}
+
+#[derive(StructOpt, Debug)]
+pub struct OptScriptsConfigRmGistId {
+    /// [cargo] Path to Cargo.toml
+    #[structopt(long, value_name("PATH"))]
+    pub manifest_path: Option<PathBuf>,
+    /// [cargo] Coloring
+    #[structopt(
+        long,
+        value_name("WHEN"),
+        possible_values(AnsiColorChoice::VARIANTS),
+        default_value("auto")
+    )]
+    pub color: AnsiColorChoice,
+    /// Dry run
+    #[structopt(long)]
+    pub dry_run: bool,
+    /// Key (Package **name**)
+    pub package: String,
+}
+
 #[derive(Debug)]
 pub struct Context<R, W> {
     pub cwd: PathBuf,
@@ -392,6 +479,15 @@ pub fn run<R: Read, W: Write>(opt: Opt, ctx: Context<R, W>) -> anyhow::Result<()
         Opt::Scripts(OptScripts::Export(opt)) => export(opt, ctx),
         Opt::Scripts(OptScripts::Gist(OptScriptsGist::Clone(opt))) => gist_clone(opt, ctx),
         Opt::Scripts(OptScripts::Gist(OptScriptsGist::Pull(opt))) => gist_pull(opt, ctx),
+        Opt::Scripts(OptScripts::Config(OptScriptsConfig::Set(OptScriptsConfigSet::Base(opt)))) => {
+            config_set_base(opt, ctx)
+        }
+        Opt::Scripts(OptScripts::Config(OptScriptsConfig::Set(OptScriptsConfigSet::GistId(
+            opt,
+        )))) => config_set_gist_id(opt, ctx),
+        Opt::Scripts(OptScripts::Config(OptScriptsConfig::Remove(
+            OptScriptsConfigRemove::GistId(opt),
+        ))) => config_remove_gist_id(opt, ctx),
     }
 }
 
@@ -719,9 +815,7 @@ fn gist_clone(
         package_name, old_gist_id, gist_id,
     );
     config.gist_ids.insert(package_name, gist_id);
-    if !dry_run {
-        config.store(&workspace_root)?;
-    }
+    config.store(dry_run)?;
     Ok(())
 }
 
@@ -769,6 +863,78 @@ fn gist_pull(opt: OptScriptsGistPull, ctx: Context<impl Sized, impl Sized>) -> a
             info!("Wrote {}", path.display());
         }
     }
+    Ok(())
+}
+
+fn config_set_base(
+    opt: OptScriptsConfigSetBase,
+    ctx: Context<impl Sized, impl Sized>,
+) -> anyhow::Result<()> {
+    let OptScriptsConfigSetBase {
+        manifest_path,
+        color,
+        dry_run,
+        path,
+    } = opt;
+
+    (ctx.init_logger)(color);
+
+    let cargo_metadata::Metadata { workspace_root, .. } =
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+    let mut config = CargoScriptsConfig::load(&workspace_root)?;
+    info!("`base`: {:?} → {:?}", config.base, path);
+    config.base = path;
+    config.store(dry_run)?;
+    Ok(())
+}
+
+fn config_set_gist_id(
+    opt: OptScriptsConfigSetGistId,
+    ctx: Context<impl Sized, impl Sized>,
+) -> anyhow::Result<()> {
+    let OptScriptsConfigSetGistId {
+        manifest_path,
+        color,
+        dry_run,
+        package,
+        gist_id,
+    } = opt;
+
+    (ctx.init_logger)(color);
+
+    let cargo_metadata::Metadata { workspace_root, .. } =
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+    let mut config = CargoScriptsConfig::load(&workspace_root)?;
+    info!(
+        "`gist_ids.{:?}`: {:?} → {:?}",
+        package,
+        config.gist_ids.get(&package),
+        gist_id,
+    );
+    config.gist_ids.insert(package, gist_id);
+    config.store(dry_run)?;
+    Ok(())
+}
+
+fn config_remove_gist_id(
+    opt: OptScriptsConfigRmGistId,
+    ctx: Context<impl Sized, impl Sized>,
+) -> anyhow::Result<()> {
+    let OptScriptsConfigRmGistId {
+        manifest_path,
+        color,
+        dry_run,
+        package,
+    } = opt;
+
+    (ctx.init_logger)(color);
+
+    let cargo_metadata::Metadata { workspace_root, .. } =
+        cargo_metadata_no_deps_expecting_virtual(manifest_path.as_deref(), color, &ctx.cwd)?;
+    let mut config = CargoScriptsConfig::load(&workspace_root)?;
+    config.gist_ids.remove(&package);
+    info!("Removed `gist_ids.{:?}`", package);
+    config.store(dry_run)?;
     Ok(())
 }
 
@@ -1218,18 +1384,22 @@ struct CargoScriptsConfig {
     base: String,
     #[serde(default)]
     gist_ids: BTreeMap<String, String>,
+    #[serde(skip)]
+    path: PathBuf,
 }
 
 impl CargoScriptsConfig {
     fn load(workspace_root: &Path) -> anyhow::Result<Self> {
-        let (_, this) = read_toml(workspace_root.join("cargo-scripts.toml"))?;
-        Ok(this)
+        let path = workspace_root.join("cargo-scripts.toml");
+        let (_, this) = read_toml(&path)?;
+        Ok(Self { path, ..this })
     }
 
-    fn store(&self, workspace_root: &Path) -> anyhow::Result<()> {
-        let path = workspace_root.join("cargo-scripts.toml");
-        write(&path, &toml::to_string(self).unwrap())?;
-        info!("Wrote {}", path.display());
+    fn store(&self, dry_run: bool) -> anyhow::Result<()> {
+        if !dry_run {
+            write(&self.path, &toml::to_string(self).unwrap())?;
+        }
+        info!("Wrote {}", self.path.display());
         Ok(())
     }
 }
